@@ -50913,6 +50913,10 @@ async function createWasm() {
     assert(wasmMemory, 'memory not found in wasm exports');
     updateMemoryViews();
 
+    wasmTable = wasmExports['__indirect_function_table'];
+    
+    assert(wasmTable, 'table not found in wasm exports');
+
     addOnInit(wasmExports['__wasm_call_ctors']);
 
     removeRunDependency('wasm-instantiate');
@@ -54099,6 +54103,172 @@ var tempI64;
 
 
 
+  var uleb128Encode = (n, target) => {
+      assert(n < 16384);
+      if (n < 128) {
+        target.push(n);
+      } else {
+        target.push((n % 128) | 128, n >> 7);
+      }
+    };
+  
+  var sigToWasmTypes = (sig) => {
+      assert(!sig.includes('j'), 'i64 not permitted in function signatures when WASM_BIGINT is disabled');
+      var typeNames = {
+        'i': 'i32',
+        'j': 'i64',
+        'f': 'f32',
+        'd': 'f64',
+        'e': 'externref',
+        'p': 'i32',
+      };
+      var type = {
+        parameters: [],
+        results: sig[0] == 'v' ? [] : [typeNames[sig[0]]]
+      };
+      for (var i = 1; i < sig.length; ++i) {
+        assert(sig[i] in typeNames, 'invalid signature char: ' + sig[i]);
+        type.parameters.push(typeNames[sig[i]]);
+      }
+      return type;
+    };
+  
+  var generateFuncType = (sig, target) => {
+      var sigRet = sig.slice(0, 1);
+      var sigParam = sig.slice(1);
+      var typeCodes = {
+        'i': 0x7f, // i32
+        'p': 0x7f, // i32
+        'j': 0x7e, // i64
+        'f': 0x7d, // f32
+        'd': 0x7c, // f64
+        'e': 0x6f, // externref
+      };
+  
+      // Parameters, length + signatures
+      target.push(0x60 /* form: func */);
+      uleb128Encode(sigParam.length, target);
+      for (var i = 0; i < sigParam.length; ++i) {
+        assert(sigParam[i] in typeCodes, 'invalid signature char: ' + sigParam[i]);
+        target.push(typeCodes[sigParam[i]]);
+      }
+  
+      // Return values, length + signatures
+      // With no multi-return in MVP, either 0 (void) or 1 (anything else)
+      if (sigRet == 'v') {
+        target.push(0x00);
+      } else {
+        target.push(0x01, typeCodes[sigRet]);
+      }
+    };
+  var convertJsFunctionToWasm = (func, sig) => {
+      // return func;
+    };
+  
+  var wasmTableMirror = [];
+  
+  /** @type {WebAssembly.Table} */
+  var wasmTable;
+  var getWasmTableEntry = (funcPtr) => {
+      var func = wasmTableMirror[funcPtr];
+      if (!func) {
+        if (funcPtr >= wasmTableMirror.length) wasmTableMirror.length = funcPtr + 1;
+        /** @suppress {checkTypes} */
+        wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+      }
+      /** @suppress {checkTypes} */
+      assert(wasmTable.get(funcPtr) == func, 'JavaScript-side Wasm function table mirror is out of date!');
+      return func;
+    };
+  
+  var updateTableMap = (offset, count) => {
+      if (functionsInTableMap) {
+        for (var i = offset; i < offset + count; i++) {
+          var item = getWasmTableEntry(i);
+          // Ignore null values.
+          if (item) {
+            functionsInTableMap.set(item, i);
+          }
+        }
+      }
+    };
+  
+  var functionsInTableMap;
+  
+  var getFunctionAddress = (func) => {
+      // First, create the map if this is the first use.
+      if (!functionsInTableMap) {
+        functionsInTableMap = new WeakMap();
+        updateTableMap(0, wasmTable.length);
+      }
+      return functionsInTableMap.get(func) || 0;
+    };
+  
+  
+  var freeTableIndexes = [];
+  
+  var getEmptyTableSlot = () => {
+      // Reuse a free index if there is one, otherwise grow.
+      if (freeTableIndexes.length) {
+        return freeTableIndexes.pop();
+      }
+      // Grow the table
+      try {
+        /** @suppress {checkTypes} */
+        wasmTable.grow(1);
+      } catch (err) {
+        if (!(err instanceof RangeError)) {
+          throw err;
+        }
+        throw 'Unable to grow wasm table. Set ALLOW_TABLE_GROWTH.';
+      }
+      return wasmTable.length - 1;
+    };
+  
+  
+  
+  var setWasmTableEntry = (idx, func) => {
+      /** @suppress {checkTypes} */
+      wasmTable.set(idx, func);
+      // With ABORT_ON_WASM_EXCEPTIONS wasmTable.get is overridden to return wrapped
+      // functions so we need to call it here to retrieve the potential wrapper correctly
+      // instead of just storing 'func' directly into wasmTableMirror
+      /** @suppress {checkTypes} */
+      wasmTableMirror[idx] = wasmTable.get(idx);
+    };
+  
+  /** @param {string=} sig */
+  var addFunction = (func, sig) => {
+      assert(typeof func != 'undefined');
+      // Check if the function is already in the table, to ensure each function
+      // gets a unique index.
+      var rtn = getFunctionAddress(func);
+      if (rtn) {
+        return rtn;
+      }
+  
+      // It's not in the table, add it now.
+  
+      var ret = getEmptyTableSlot();
+  
+      // Set the new value.
+      try {
+        // Attempting to call this with JS function will cause of table.set() to fail
+        setWasmTableEntry(ret, func);
+      } catch (err) {
+        if (!(err instanceof TypeError)) {
+          throw err;
+        }
+        assert(typeof sig != 'undefined', 'Missing signature argument to addFunction: ' + func);
+        var wrapped = convertJsFunctionToWasm(func, sig);
+        setWasmTableEntry(ret, wrapped);
+      }
+  
+      functionsInTableMap.set(func, ret);
+  
+      return ret;
+    };
+
   FS.createPreloadedFile = FS_createPreloadedFile;
   FS.staticInit();
   // Set module methods based on EXPORTED_RUNTIME_METHODS
@@ -54178,6 +54348,7 @@ var dynCall_jiji = Module['dynCall_jiji'] = createExportWrapper('dynCall_jiji', 
 
 Module['ccall'] = ccall;
 Module['cwrap'] = cwrap;
+Module['addFunction'] = addFunction;
 Module['setValue'] = setValue;
 Module['getValue'] = getValue;
 var missingLibrarySymbols = [
@@ -54221,14 +54392,6 @@ var missingLibrarySymbols = [
   'STACK_ALIGN',
   'POINTER_SIZE',
   'ASSERTIONS',
-  'uleb128Encode',
-  'sigToWasmTypes',
-  'generateFuncType',
-  'convertJsFunctionToWasm',
-  'getEmptyTableSlot',
-  'updateTableMap',
-  'getFunctionAddress',
-  'addFunction',
   'removeFunction',
   'reallyNegative',
   'unSign',
@@ -54389,8 +54552,15 @@ var unexportedSymbols = [
   'wasmTable',
   'noExitRuntime',
   'getCFunc',
+  'uleb128Encode',
+  'sigToWasmTypes',
+  'generateFuncType',
+  'convertJsFunctionToWasm',
   'freeTableIndexes',
   'functionsInTableMap',
+  'getEmptyTableSlot',
+  'updateTableMap',
+  'getFunctionAddress',
   'PATH',
   'PATH_FS',
   'UTF8Decoder',
