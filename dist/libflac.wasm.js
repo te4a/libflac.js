@@ -621,7 +621,7 @@ async function createWasm() {
     updateMemoryViews();
 
     wasmTable = wasmExports['__indirect_function_table'];
-    
+    Module['wasmTable'] = wasmTable;
 
     addOnInit(wasmExports['__wasm_call_ctors']);
 
@@ -3495,6 +3495,9 @@ async function createWasm() {
   }
   }
 
+  /** @type {WebAssembly.Table} */
+  var wasmTable;
+
   var getCFunc = (ident) => {
       var func = Module['_' + ident]; // closure exported function
       return func;
@@ -3697,8 +3700,6 @@ async function createWasm() {
   
   var wasmTableMirror = [];
   
-  /** @type {WebAssembly.Table} */
-  var wasmTable;
   var getWasmTableEntry = (funcPtr) => {
       var func = wasmTableMirror[funcPtr];
       if (!func) {
@@ -3867,6 +3868,7 @@ var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmE
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
 
+Module['wasmTable'] = wasmTable;
 Module['ccall'] = ccall;
 Module['cwrap'] = cwrap;
 Module['addFunction'] = addFunction;

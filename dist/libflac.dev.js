@@ -50914,7 +50914,7 @@ async function createWasm() {
     updateMemoryViews();
 
     wasmTable = wasmExports['__indirect_function_table'];
-    
+    Module['wasmTable'] = wasmTable;
     assert(wasmTable, 'table not found in wasm exports');
 
     addOnInit(wasmExports['__wasm_call_ctors']);
@@ -54005,6 +54005,9 @@ var tempI64;
   }
   }
 
+  /** @type {WebAssembly.Table} */
+  var wasmTable;
+
   var getCFunc = (ident) => {
       var func = Module['_' + ident]; // closure exported function
       assert(func, 'Cannot call unknown function ' + ident + ', make sure it is exported');
@@ -54167,8 +54170,6 @@ var tempI64;
   
   var wasmTableMirror = [];
   
-  /** @type {WebAssembly.Table} */
-  var wasmTable;
   var getWasmTableEntry = (funcPtr) => {
       var func = wasmTableMirror[funcPtr];
       if (!func) {
@@ -54346,6 +54347,7 @@ var dynCall_jiji = Module['dynCall_jiji'] = createExportWrapper('dynCall_jiji', 
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
 
+Module['wasmTable'] = wasmTable;
 Module['ccall'] = ccall;
 Module['cwrap'] = cwrap;
 Module['addFunction'] = addFunction;
@@ -54549,7 +54551,6 @@ var unexportedSymbols = [
   'asyncLoad',
   'alignMemory',
   'mmapAlloc',
-  'wasmTable',
   'noExitRuntime',
   'getCFunc',
   'uleb128Encode',
