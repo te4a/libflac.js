@@ -48,6 +48,8 @@ OGG:=libogg-$(OGG_VERSION)
 OGG_URL:="https://ftp.osuosl.org/pub/xiph/releases/ogg/$(OGG).tar.xz"
 OGG_MAKEFILE:=$(OGG)/Makefile
 OGG_LIB:=$(OGG)/src/lib/libogg.a
+OGG_OPTS = --disable-shared --enable-static
+
 
 all: release_libs min_libs dev_libs
 
@@ -92,7 +94,7 @@ $(OGG): $(OGG).tar.xz
 
 $(OGG_MAKEFILE): $(OGG)
 	cd $(OGG) && \
-	$(EMCONFIGURE) ./configure
+	CFLAGS="-O2" $(EMCONFIGURE) ./configure $(OGG_OPTS)
 
 $(OGG_LIB): $(OGG_MAKEFILE)
 	cd $(OGG) && \
