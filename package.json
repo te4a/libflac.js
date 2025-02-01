@@ -1,6 +1,6 @@
 {
   "name": "libflacjs",
-  "version": "5.4.1-beta.1",
+  "version": "5.4.1-beta.2",
   "main": "index.js",
   "description": "FLAC data stream encoder and decoder compiled in JavaScript using emscripten.",
   "directories": {
@@ -11,13 +11,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mmig/libflac.js.git"
+    "url": "git+https://github.com/te4a/libflac.js.git"
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/mmig/libflac.js/issues"
+    "url": "https://github.com/te4a/libflac.js/issues"
   },
-  "homepage": "https://github.com/mmig/libflac.js",
+  "homepage": "https://github.com/te4a/libflac.js",
   "keywords": [
     "flac",
     "audio",
