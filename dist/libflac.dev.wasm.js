@@ -899,7 +899,7 @@ async function createWasm() {
     updateMemoryViews();
 
     wasmTable = wasmExports['__indirect_function_table'];
-    
+    Module['wasmTable'] = wasmTable;
     assert(wasmTable, 'table not found in wasm exports');
 
     addOnInit(wasmExports['__wasm_call_ctors']);
@@ -4298,6 +4298,7 @@ async function createWasm() {
       freeTableIndexes.push(index);
     };
 
+
   FS.createPreloadedFile = FS_createPreloadedFile;
   FS.staticInit();
   // Set module methods based on EXPORTED_RUNTIME_METHODS
@@ -4374,6 +4375,7 @@ var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmE
 // include: postamble.js
 // === Auto-generated postamble setup entry stuff ===
 
+Module['wasmTable'] = wasmTable;
 Module['ccall'] = ccall;
 Module['cwrap'] = cwrap;
 Module['addFunction'] = addFunction;
@@ -4579,7 +4581,6 @@ var unexportedSymbols = [
   'asyncLoad',
   'alignMemory',
   'mmapAlloc',
-  'wasmTable',
   'noExitRuntime',
   'getCFunc',
   'uleb128Encode',
