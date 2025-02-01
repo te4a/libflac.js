@@ -281,9 +281,218 @@ if (Module['arguments']) arguments_ = Module['arguments'];
 if (Module['thisProgram']) thisProgram = Module['thisProgram'];
 
 // perform assertions in shell.js after we set up out() and err(), as otherwise if an assertion fails it cannot print the message
-// end include: shell.js
 
-// include: preamble.js
+
+
+
+
+// {{PREAMBLE_ADDITIONS}}
+
+var STACK_ALIGN = 16;
+
+function dynamicAlloc(size) {
+  var ret = HEAP32[DYNAMICTOP_PTR>>2];
+  var end = (ret + size + 15) & -16;
+  HEAP32[DYNAMICTOP_PTR>>2] = end;
+  return ret;
+}
+
+function alignMemory(size, factor) {
+  if (!factor) factor = STACK_ALIGN; // stack alignment (16-byte) by default
+  return Math.ceil(size / factor) * factor;
+}
+
+function getNativeTypeSize(type) {
+  switch (type) {
+    case 'i1': case 'i8': return 1;
+    case 'i16': return 2;
+    case 'i32': return 4;
+    case 'i64': return 8;
+    case 'float': return 4;
+    case 'double': return 8;
+    default: {
+      if (type[type.length-1] === '*') {
+        return 4; // A pointer
+      } else if (type[0] === 'i') {
+        var bits = Number(type.substr(1));
+        assert(bits % 8 === 0, 'getNativeTypeSize invalid bits ' + bits + ', type ' + type);
+        return bits / 8;
+      } else {
+        return 0;
+      }
+    }
+  }
+}
+
+function warnOnce(text) {
+  if (!warnOnce.shown) warnOnce.shown = {};
+  if (!warnOnce.shown[text]) {
+    warnOnce.shown[text] = 1;
+    err(text);
+  }
+}
+
+
+
+
+
+
+
+
+// Wraps a JS function as a wasm function with a given signature.
+function convertJsFunctionToWasm(func, sig) {
+  return func;
+}
+
+var freeTableIndexes = [];
+
+// Weak map of functions in the table to their indexes, created on first use.
+var functionsInTableMap;
+
+// Add a wasm function to the table.
+function addFunctionWasm(func, sig) {
+  var table = wasmTable;
+
+  // Check if the function is already in the table, to ensure each function
+  // gets a unique index. First, create the map if this is the first use.
+  if (!functionsInTableMap) {
+    functionsInTableMap = new WeakMap();
+    for (var i = 0; i < table.length; i++) {
+      var item = table.get(i);
+      // Ignore null values.
+      if (item) {
+        functionsInTableMap.set(item, i);
+      }
+    }
+  }
+  if (functionsInTableMap.has(func)) {
+    return functionsInTableMap.get(func);
+  }
+
+  // It's not in the table, add it now.
+
+
+  var ret;
+  // Reuse a free index if there is one, otherwise grow.
+  if (freeTableIndexes.length) {
+    ret = freeTableIndexes.pop();
+  } else {
+    ret = table.length;
+    // Grow the table
+    try {
+      table.grow(1);
+    } catch (err) {
+      if (!(err instanceof RangeError)) {
+        throw err;
+      }
+      throw 'Unable to grow wasm table. Set ALLOW_TABLE_GROWTH.';
+    }
+  }
+
+  // Set the new value.
+  try {
+    // Attempting to call this with JS function will cause of table.set() to fail
+    table.set(ret, func);
+  } catch (err) {
+    if (!(err instanceof TypeError)) {
+      throw err;
+    }
+    var wrapped = convertJsFunctionToWasm(func, sig);
+    table.set(ret, wrapped);
+  }
+
+  functionsInTableMap.set(func, ret);
+
+  return ret;
+}
+
+function removeFunctionWasm(index) {
+  functionsInTableMap.delete(wasmTable.get(index));
+  freeTableIndexes.push(index);
+}
+
+// 'sig' parameter is required for the llvm backend but only when func is not
+// already a WebAssembly function.
+function addFunction(func, sig) {
+
+  return addFunctionWasm(func, sig);
+}
+
+function removeFunction(index) {
+  removeFunctionWasm(index);
+}
+
+
+
+var funcWrappers = {};
+
+function getFuncWrapper(func, sig) {
+  if (!func) return; // on null pointer, return undefined
+  assert(sig);
+  if (!funcWrappers[sig]) {
+    funcWrappers[sig] = {};
+  }
+  var sigCache = funcWrappers[sig];
+  if (!sigCache[func]) {
+    // optimize away arguments usage in common cases
+    if (sig.length === 1) {
+      sigCache[func] = function dynCall_wrapper() {
+        return dynCall(sig, func);
+      };
+    } else if (sig.length === 2) {
+      sigCache[func] = function dynCall_wrapper(arg) {
+        return dynCall(sig, func, [arg]);
+      };
+    } else {
+      // general case
+      sigCache[func] = function dynCall_wrapper() {
+        return dynCall(sig, func, Array.prototype.slice.call(arguments));
+      };
+    }
+  }
+  return sigCache[func];
+}
+
+
+
+
+
+
+
+function makeBigInt(low, high, unsigned) {
+  return unsigned ? ((+((low>>>0)))+((+((high>>>0)))*4294967296.0)) : ((+((low>>>0)))+((+((high|0)))*4294967296.0));
+}
+
+/** @param {Array=} args */
+function dynCall(sig, ptr, args) {
+  if (args && args.length) {
+    return Module['dynCall_' + sig].apply(null, [ptr].concat(args));
+  } else {
+    return Module['dynCall_' + sig].call(null, ptr);
+  }
+}
+
+var tempRet0 = 0;
+
+var setTempRet0 = function(value) {
+  tempRet0 = value;
+};
+
+var getTempRet0 = function() {
+  return tempRet0;
+};
+
+
+// The address globals begin at. Very low in memory, for code size and optimization opportunities.
+// Above 0 is static memory, starting with globals.
+// Then the stack.
+// Then 'dynamic' memory for sbrk.
+var GLOBAL_BASE = 1024;
+
+
+
+
+
 // === Preamble library stuff ===
 
 // Documentation for the public APIs defined in this file must be updated in:
@@ -393,43 +602,43 @@ function initActiveSegments(imports) {
   var i32ScratchView = new Int32Array(scratchBuffer);
   var f32ScratchView = new Float32Array(scratchBuffer);
   var f64ScratchView = new Float64Array(scratchBuffer);
-  
+
   function wasm2js_scratch_load_i32(index) {
     return i32ScratchView[index];
   }
-      
+
   function wasm2js_scratch_store_i32(index, value) {
     i32ScratchView[index] = value;
   }
-      
+
   function wasm2js_scratch_load_f64() {
     return f64ScratchView[0];
   }
-      
+
   function wasm2js_scratch_store_f64(value) {
     f64ScratchView[0] = value;
   }
-      
+
   function wasm2js_memory_copy(dest, source, size) {
     // TODO: traps on invalid things
     bufferView.copyWithin(dest, source, source + size);
   }
-      
+
   function wasm2js_memory_fill(dest, value, size) {
     dest = dest >>> 0;
     size = size >>> 0;
     if (dest + size > bufferView.length) throw "trap: invalid memory.fill";
     bufferView.fill(value, dest, dest + size);
   }
-      
+
   function wasm2js_scratch_store_f32(value) {
     f32ScratchView[2] = value;
   }
-      
+
   function wasm2js_scratch_load_f32() {
     return f32ScratchView[2];
   }
-      
+
 function asmFunc(imports) {
  var buffer = new ArrayBuffer(16908288);
  var HEAP8 = new Int8Array(buffer);
@@ -464,9 +673,9 @@ function asmFunc(imports) {
  // EMSCRIPTEN_START_FUNCS
 ;
  function __wasm_call_ctors() {
-  
+
  }
- 
+
  function sbrk($0) {
   var $1 = 0, $2 = 0;
   $1 = HEAP32[4304];
@@ -487,7 +696,7 @@ function asmFunc(imports) {
   HEAP32[4304] = $0;
   return $1;
  }
- 
+
  function __memcpy($0, $1, $2) {
   var $3 = 0, $4 = 0;
   if ($2 >>> 0 >= 512) {
@@ -605,7 +814,7 @@ function asmFunc(imports) {
    }
   }
  }
- 
+
  function emscripten_builtin_malloc($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $10 = __stack_pointer - 16 | 0;
@@ -1658,7 +1867,7 @@ function asmFunc(imports) {
   __stack_pointer = $10 + 16 | 0;
   return $0;
  }
- 
+
  function emscripten_builtin_free($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   block : {
@@ -1995,7 +2204,7 @@ function asmFunc(imports) {
    HEAP32[4493] = $0 ? $0 : -1;
   }
  }
- 
+
  function emscripten_builtin_realloc($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   if (!$0) {
@@ -2204,7 +2413,7 @@ function asmFunc(imports) {
   emscripten_builtin_free($0);
   return $4;
  }
- 
+
  function dispose_chunk($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $5 = $0 + $1 | 0;
@@ -2517,7 +2726,7 @@ function asmFunc(imports) {
    HEAP32[$0 + 8 >> 2] = $1;
   }
  }
- 
+
  function emscripten_builtin_calloc($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   block1 : {
@@ -2607,7 +2816,7 @@ function asmFunc(imports) {
   }
   return $0;
  }
- 
+
  function frexp($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   wasm2js_scratch_store_f64(+$0);
@@ -2632,7 +2841,7 @@ function asmFunc(imports) {
   }
   return $0;
  }
- 
+
  function __ashlti3($0, $1, $2, $3, $4, $5) {
   var $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   block1 : {
@@ -2691,7 +2900,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 8 >> 2] = $3;
   HEAP32[$0 + 12 >> 2] = $4;
  }
- 
+
  function __lshrti3($0, $1, $2, $3, $4, $5) {
   var $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   block1 : {
@@ -2749,7 +2958,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 8 >> 2] = $3;
   HEAP32[$0 + 12 >> 2] = $4;
  }
- 
+
  function FLAC__crc8($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   block1 : {
@@ -2790,7 +2999,7 @@ function asmFunc(imports) {
   }
   return $1 & 255;
  }
- 
+
  function FLAC__crc16_update_words32($0, $1, $2) {
   var $3 = 0;
   if ($1 >>> 0 >= 2) {
@@ -2816,7 +3025,7 @@ function asmFunc(imports) {
   }
   return $2 & 65535;
  }
- 
+
  function FLAC__bitreader_delete($0) {
   var $1 = 0;
   $1 = HEAP32[$0 >> 2];
@@ -2825,15 +3034,15 @@ function asmFunc(imports) {
   }
   emscripten_builtin_free($0);
  }
- 
+
  function FLAC__bitreader_is_consumed_byte_aligned($0) {
   return !(HEAPU8[$0 + 20 | 0] & 7);
  }
- 
+
  function FLAC__bitreader_bits_left_for_byte_alignment($0) {
   return 8 - (HEAP32[$0 + 20 >> 2] & 7) | 0;
  }
- 
+
  function FLAC__bitreader_read_raw_uint32($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   block6 : {
@@ -2906,7 +3115,7 @@ function asmFunc(imports) {
   }
   return 1;
  }
- 
+
  function bitreader_read_from_client_($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $9 = __stack_pointer - 16 | 0;
@@ -3053,7 +3262,7 @@ function asmFunc(imports) {
   __stack_pointer = $9 + 16 | 0;
   return $2;
  }
- 
+
  function FLAC__bitreader_read_raw_int32($0, $1, $2) {
   var $3 = 0, $4 = 0;
   $3 = __stack_pointer - 16 | 0;
@@ -3072,7 +3281,7 @@ function asmFunc(imports) {
   __stack_pointer = $3 + 16 | 0;
   return $4;
  }
- 
+
  function FLAC__bitreader_read_raw_uint64($0, $1, $2) {
   var $3 = 0, $4 = 0;
   $3 = __stack_pointer - 16 | 0;
@@ -3103,7 +3312,7 @@ function asmFunc(imports) {
   __stack_pointer = $3 + 16 | 0;
   return $4;
  }
- 
+
  function FLAC__bitreader_read_uint32_little_endian($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0;
   $2 = __stack_pointer - 16 | 0;
@@ -3132,7 +3341,7 @@ function asmFunc(imports) {
   __stack_pointer = $2 + 16 | 0;
   return $7;
  }
- 
+
  function FLAC__bitreader_skip_bits_no_crc($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   $4 = __stack_pointer - 16 | 0;
@@ -3222,7 +3431,7 @@ function asmFunc(imports) {
   __stack_pointer = $4 + 16 | 0;
   return $0;
  }
- 
+
  function FLAC__bitreader_skip_byte_block_aligned_no_crc($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   $2 = __stack_pointer - 16 | 0;
@@ -3289,7 +3498,7 @@ function asmFunc(imports) {
   __stack_pointer = $2 + 16 | 0;
   return $3;
  }
- 
+
  function FLAC__bitreader_read_byte_block_aligned_no_crc($0, $1, $2) {
   var $3 = 0, $4 = 0;
   $4 = __stack_pointer - 16 | 0;
@@ -3370,7 +3579,7 @@ function asmFunc(imports) {
   __stack_pointer = $4 + 16 | 0;
   return $3;
  }
- 
+
  function FLAC__bitreader_read_unary_unsigned($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   HEAP32[$1 >> 2] = 0;
@@ -3458,7 +3667,7 @@ function asmFunc(imports) {
   }
   return 1;
  }
- 
+
  function sift($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
   $5 = __stack_pointer - 240 | 0;
@@ -3494,7 +3703,7 @@ function asmFunc(imports) {
   cycle($5, $6);
   __stack_pointer = $5 + 240 | 0;
  }
- 
+
  function shr($0, $1) {
   var $2 = 0, $3 = 0;
   $2 = HEAP32[$0 + 4 >> 2];
@@ -3510,7 +3719,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 4 >> 2] = $2 >>> $1;
   HEAP32[$0 >> 2] = $2 << 32 - $1 | $3 >>> $1;
  }
- 
+
  function trinkle($0, $1, $2, $3, $4) {
   var $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   $6 = __stack_pointer - 240 | 0;
@@ -3584,7 +3793,7 @@ function asmFunc(imports) {
   }
   __stack_pointer = $6 + 240 | 0;
  }
- 
+
  function shl($0, $1) {
   var $2 = 0, $3 = 0;
   block1 : {
@@ -3600,7 +3809,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = $3 << $1;
   HEAP32[$0 + 4 >> 2] = $2 << $1 | $3 >>> 32 - $1;
  }
- 
+
  function pntz($0) {
   var $1 = 0;
   $1 = a_ctz_32(HEAP32[$0 >> 2] - 1 | 0);
@@ -3610,7 +3819,7 @@ function asmFunc(imports) {
   }
   return $1;
  }
- 
+
  function cycle($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0;
   $2 = 24;
@@ -3642,19 +3851,19 @@ function asmFunc(imports) {
   }
   __stack_pointer = $5 + 256 | 0;
  }
- 
+
  function a_ctz_32($0) {
   var wasm2js_i32$0 = 0, wasm2js_i32$1 = 0, wasm2js_i32$2 = 0;
   return wasm2js_i32$0 = __wasm_ctz_i32($0), wasm2js_i32$1 = 0, wasm2js_i32$2 = $0, wasm2js_i32$2 ? wasm2js_i32$0 : wasm2js_i32$1;
  }
- 
+
  function wrapper_cmp($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
   $2 = $2 | 0;
   return FUNCTION_TABLE[$2 | 0]($0, $1) | 0;
  }
- 
+
  function FLAC__format_seektable_sort($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
   block : {
@@ -3870,7 +4079,7 @@ function asmFunc(imports) {
    };
   }
  }
- 
+
  function seekpoint_compare_($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -3881,13 +4090,13 @@ function asmFunc(imports) {
   $1 = HEAP32[$1 + 4 >> 2];
   return (($0 | 0) == ($1 | 0) & $2 >>> 0 > $3 >>> 0 | $0 >>> 0 > $1 >>> 0) - (($0 | 0) == ($1 | 0) & $2 >>> 0 < $3 >>> 0 | $0 >>> 0 < $1 >>> 0) | 0;
  }
- 
+
  function FLAC__format_entropy_coding_method_partitioned_rice_contents_init($0) {
   HEAP32[$0 + 8 >> 2] = 0;
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function FLAC__format_entropy_coding_method_partitioned_rice_contents_clear($0) {
   var $1 = 0;
   $1 = HEAP32[$0 >> 2];
@@ -3902,7 +4111,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function FLAC__format_entropy_coding_method_partitioned_rice_contents_ensure_size($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   $3 = 1;
@@ -3942,7 +4151,7 @@ function asmFunc(imports) {
   }
   return $3;
  }
- 
+
  function ogg_stream_init($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   $2 = -1;
@@ -3977,7 +4186,7 @@ function asmFunc(imports) {
   }
   return $2;
  }
- 
+
  function ogg_stream_clear($0) {
   var $1 = 0;
   if ($0) {
@@ -3996,7 +4205,7 @@ function asmFunc(imports) {
    wasm2js_memory_fill($0, 0, 360);
   }
  }
- 
+
  function ogg_page_checksum_set($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0;
   if ($0) {
@@ -4073,7 +4282,7 @@ function asmFunc(imports) {
    HEAP8[HEAP32[$0 >> 2] + 25 | 0] = $2 >>> 24;
   }
  }
- 
+
  function _os_body_expand($0, $1) {
   var $2 = 0;
   folding_inner0 : {
@@ -4108,7 +4317,7 @@ function asmFunc(imports) {
   wasm2js_memory_fill($0, 0, 360);
   return -1;
  }
- 
+
  function _os_lacing_expand($0, $1) {
   var $2 = 0;
   folding_inner0 : {
@@ -4148,7 +4357,7 @@ function asmFunc(imports) {
   wasm2js_memory_fill($0, 0, 360);
   return -1;
  }
- 
+
  function ogg_stream_flush_i($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0;
   $14 = HEAP32[$0 >> 2];
@@ -4394,7 +4603,7 @@ function asmFunc(imports) {
   }
   return $13;
  }
- 
+
  function ogg_sync_reset($0) {
   if (HEAP32[$0 + 4 >> 2] < 0) {
    return
@@ -4406,7 +4615,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function ogg_stream_reset($0) {
   if (!$0 | !HEAP32[$0 >> 2]) {
    $0 = -1
@@ -4428,11 +4637,11 @@ function asmFunc(imports) {
    $0 = 0;
   }
  }
- 
+
  function FLAC__ogg_decoder_aspect_set_defaults($0) {
   HEAP32[$0 >> 2] = 1;
  }
- 
+
  function FLAC__MD5Init($0) {
   HEAP32[$0 + 80 >> 2] = 0;
   HEAP32[$0 + 84 >> 2] = 0;
@@ -4444,7 +4653,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function FLAC__MD5Final($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   $2 = HEAP32[$1 + 80 >> 2] & 63;
@@ -4497,7 +4706,7 @@ function asmFunc(imports) {
   }
   wasm2js_memory_fill($1, 0, 96);
  }
- 
+
  function FLAC__MD5Transform($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $11 = HEAP32[$1 + 16 >> 2];
@@ -4599,7 +4808,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 8 >> 2] = $3 + $10;
   (wasm2js_i32$0 = $0, wasm2js_i32$1 = __wasm_rotl_i32((($2 + $13 | 0) + ($1 ^ ($3 | $4 ^ -1)) | 0) - 343485551 | 0, 21) + ($3 + $7 | 0) | 0), HEAP32[wasm2js_i32$0 + 4 >> 2] = wasm2js_i32$1;
  }
- 
+
  function FLAC__MD5Accumulate($0, $1, $2, $3, $4) {
   var $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0;
   __wasm_i64_mul($4, 0, $2, 0);
@@ -5634,7 +5843,7 @@ function asmFunc(imports) {
   }
   return $5;
  }
- 
+
  function __wasi_syscall_ret($0) {
   if (!$0) {
    return 0
@@ -5642,12 +5851,12 @@ function asmFunc(imports) {
   HEAP32[4484] = $0;
   return -1;
  }
- 
+
  function __stdio_close($0) {
   $0 = $0 | 0;
   return __wasi_syscall_ret(__wasi_fd_close(HEAP32[$0 + 60 >> 2]) | 0) | 0;
  }
- 
+
  function __stdio_read($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -5691,7 +5900,7 @@ function asmFunc(imports) {
   __stack_pointer = $4 + 32 | 0;
   return $5 | 0;
  }
- 
+
  function __stdio_seek($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -5705,7 +5914,7 @@ function asmFunc(imports) {
   i64toi32_i32$HIGH_BITS = $0 ? -1 : HEAP32[$4 + 12 >> 2];
   return ($0 ? -1 : HEAP32[$4 + 8 >> 2]) | 0;
  }
- 
+
  function fflush($0) {
   var $1 = 0, $2 = 0, $3 = 0;
   if (!$0) {
@@ -5761,7 +5970,7 @@ function asmFunc(imports) {
   }
   return $1;
  }
- 
+
  function fclose($0) {
   var $1 = 0, $2 = 0;
   fflush($0);
@@ -5782,7 +5991,7 @@ function asmFunc(imports) {
    emscripten_builtin_free($0);
   }
  }
- 
+
  function memcmp($0, $1, $2) {
   var $3 = 0, $4 = 0;
   block2 : {
@@ -5826,7 +6035,7 @@ function asmFunc(imports) {
   }
   return 0;
  }
- 
+
  function FLAC__cpu_info($0) {
   var $1 = 0;
   HEAP32[$0 + 8 >> 2] = 0;
@@ -5852,7 +6061,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function lround($0) {
   var $1 = 0.0, $2 = 0, $3 = 0;
   wasm2js_scratch_store_f64(+$0);
@@ -5890,14 +6099,14 @@ function asmFunc(imports) {
   }
   return $2;
  }
- 
+
  function fp_barrier($0) {
   var $1 = 0;
   $1 = __stack_pointer - 16 | 0;
   HEAPF64[$1 + 8 >> 3] = $0;
   return HEAPF64[$1 + 8 >> 3];
  }
- 
+
  function log($0) {
   var $1 = 0, $2 = 0.0, $3 = 0, $4 = 0.0, $5 = 0.0, $6 = 0.0, $7 = 0, $8 = 0.0, $9 = 0.0, $10 = 0;
   wasm2js_scratch_store_f64(+$0);
@@ -5953,7 +6162,7 @@ function asmFunc(imports) {
   }
   return $0;
  }
- 
+
  function FLAC__lpc_compute_autocorrelation($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -6048,7 +6257,7 @@ function asmFunc(imports) {
    };
   }
  }
- 
+
  function FLAC__lpc_compute_residual_from_qlp_coefficients($0, $1, $2, $3, $4, $5) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -6445,7 +6654,7 @@ function asmFunc(imports) {
    HEAP32[$1 + $5 >> 2] = HEAP32[$0 >> 2] - (Math_imul($6, HEAP32[$0 - 4 >> 2]) + Math_imul($7, HEAP32[$0 - 8 >> 2]) >> $4);
   }
  }
- 
+
  function FLAC__lpc_compute_residual_from_qlp_coefficients_wide($0, $1, $2, $3, $4, $5) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -7759,7 +7968,7 @@ function asmFunc(imports) {
    HEAP32[$4 >> 2] = $2 - $0;
   }
  }
- 
+
  function FLAC__lpc_restore_signal($0, $1, $2, $3, $4, $5) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -8178,7 +8387,7 @@ function asmFunc(imports) {
    HEAP32[$2 >> 2] = HEAP32[$0 + $1 >> 2] + (Math_imul($3, $6) + Math_imul($8, HEAP32[$2 - 8 >> 2]) >> $4);
   }
  }
- 
+
  function FLAC__lpc_restore_signal_wide($0, $1, $2, $3, $4, $5) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -9481,7 +9690,7 @@ function asmFunc(imports) {
    HEAP32[$5 >> 2] = $0 + $2;
   }
  }
- 
+
  function strlen($0) {
   var $1 = 0, $2 = 0, $3 = 0;
   block2 : {
@@ -9525,7 +9734,7 @@ function asmFunc(imports) {
   }
   return $1 - $0 | 0;
  }
- 
+
  function strchr($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0;
   __inlined_func$__strchrnul$38 : {
@@ -9588,7 +9797,7 @@ function asmFunc(imports) {
   }
   return HEAPU8[$0 | 0] == ($1 & 255) ? $0 : 0;
  }
- 
+
  function __stdio_write($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -9663,7 +9872,7 @@ function asmFunc(imports) {
   __stack_pointer = $3 + 32 | 0;
   return $1 | 0;
  }
- 
+
  function FLAC__memory_alloc_aligned_int32_array($0, $1, $2) {
   var $3 = 0;
   block : {
@@ -9685,7 +9894,7 @@ function asmFunc(imports) {
   }
   return $3;
  }
- 
+
  function safe_malloc_mul_2op_p($0, $1) {
   var $2 = 0;
   $2 = 1;
@@ -9702,7 +9911,7 @@ function asmFunc(imports) {
   }
   return $2;
  }
- 
+
  function FLAC__fixed_compute_best_predictor($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -9789,7 +9998,7 @@ function asmFunc(imports) {
   (wasm2js_i32$0 = $2, wasm2js_f32$0 = Math_fround(log(+($6 >>> 0) * .6931471805599453 / +($1 >>> 0)) / .6931471805599453)), HEAPF32[wasm2js_i32$0 + 16 >> 2] = wasm2js_f32$0;
   return $15 | 0;
  }
- 
+
  function FLAC__fixed_compute_best_predictor_wide($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -9909,7 +10118,7 @@ function asmFunc(imports) {
   (wasm2js_i32$0 = $2, wasm2js_f32$0 = Math_fround(log((+($12 >>> 0) + +($8 >>> 0) * 4294967296.0) * .6931471805599453 / +($1 >>> 0)) / .6931471805599453)), HEAPF32[wasm2js_i32$0 + 16 >> 2] = wasm2js_f32$0;
   return $0 | 0;
  }
- 
+
  function FLAC__stream_decoder_new() {
   var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0;
   $3 = emscripten_builtin_calloc(1, 8);
@@ -10004,7 +10213,7 @@ function asmFunc(imports) {
   }
   return 0;
  }
- 
+
  function FLAC__stream_decoder_delete($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0;
@@ -10030,7 +10239,7 @@ function asmFunc(imports) {
    emscripten_builtin_free($0);
   }
  }
- 
+
  function FLAC__stream_decoder_finish($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0, $3 = 0;
@@ -10224,7 +10433,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_decoder_init_stream($0, $1, $2, $3, $4, $5, $6, $7, $8, $9) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -10238,7 +10447,7 @@ function asmFunc(imports) {
   $9 = $9 | 0;
   return init_stream_internal_($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, 0) | 0;
  }
- 
+
  function init_stream_internal_($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) {
   var $11 = 0, $12 = 0;
   block3 : {
@@ -10335,7 +10544,7 @@ function asmFunc(imports) {
   HEAP32[HEAP32[$0 >> 2] + 4 >> 2] = 4;
   return 4;
  }
- 
+
  function read_callback_($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11196,7 +11405,7 @@ function asmFunc(imports) {
   }
   return $1 | 0;
  }
- 
+
  function FLAC__stream_decoder_reset($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0, $3 = 0;
@@ -11275,7 +11484,7 @@ function asmFunc(imports) {
   }
   return $3 | 0;
  }
- 
+
  function FLAC__stream_decoder_init_ogg_stream($0, $1, $2, $3, $4, $5, $6, $7, $8, $9) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11289,7 +11498,7 @@ function asmFunc(imports) {
   $9 = $9 | 0;
   return init_stream_internal_($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, 1) | 0;
  }
- 
+
  function FLAC__stream_decoder_set_ogg_serial_number($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11304,7 +11513,7 @@ function asmFunc(imports) {
   }
   return $0 | 0;
  }
- 
+
  function FLAC__stream_decoder_set_md5_checking($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11316,7 +11525,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_respond($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11335,7 +11544,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_respond_application($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11396,7 +11605,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 1124 >> 2] = HEAP32[$0 + 1124 >> 2] + 1;
   return 1;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_respond_all($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0;
@@ -11427,7 +11636,7 @@ function asmFunc(imports) {
   }
   return $1 | 0;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_ignore($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11446,7 +11655,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_ignore_application($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -11501,7 +11710,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 1124 >> 2] = HEAP32[$0 + 1124 >> 2] + 1;
   return 1;
  }
- 
+
  function FLAC__stream_decoder_set_metadata_ignore_all($0) {
   $0 = $0 | 0;
   var $1 = 0;
@@ -11512,17 +11721,17 @@ function asmFunc(imports) {
   }
   return $1 | 0;
  }
- 
+
  function FLAC__stream_decoder_get_state($0) {
   $0 = $0 | 0;
   return HEAP32[HEAP32[$0 >> 2] >> 2];
  }
- 
+
  function FLAC__stream_decoder_get_md5_checking($0) {
   $0 = $0 | 0;
   return HEAP32[HEAP32[$0 >> 2] + 28 >> 2];
  }
- 
+
  function FLAC__stream_decoder_process_single($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0;
@@ -11569,7 +11778,7 @@ function asmFunc(imports) {
   __stack_pointer = $1 + 16 | 0;
   return $2 | 0;
  }
- 
+
  function find_metadata_($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   $3 = __stack_pointer - 16 | 0;
@@ -11739,7 +11948,7 @@ function asmFunc(imports) {
   __stack_pointer = $3 + 16 | 0;
   return $1;
  }
- 
+
  function read_metadata_($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0;
   $5 = __stack_pointer - 192 | 0;
@@ -12587,7 +12796,7 @@ function asmFunc(imports) {
   __stack_pointer = $5 + 192 | 0;
   return $1;
  }
- 
+
  function frame_sync_($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   $3 = __stack_pointer - 16 | 0;
@@ -12707,7 +12916,7 @@ function asmFunc(imports) {
   __stack_pointer = $3 + 16 | 0;
   return $1;
  }
- 
+
  function read_frame_($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $8 = __stack_pointer - 48 | 0;
@@ -14421,7 +14630,7 @@ function asmFunc(imports) {
   __stack_pointer = $8 + 48 | 0;
   return $6;
  }
- 
+
  function FLAC__stream_decoder_process_until_end_of_metadata($0) {
   $0 = $0 | 0;
   var $1 = 0;
@@ -14454,7 +14663,7 @@ function asmFunc(imports) {
   }
   return $1 | 0;
  }
- 
+
  function FLAC__stream_decoder_process_until_end_of_stream($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0;
@@ -14497,7 +14706,7 @@ function asmFunc(imports) {
   __stack_pointer = $1 + 16 | 0;
   return $2 | 0;
  }
- 
+
  function read_callback_proxy_($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -14506,7 +14715,7 @@ function asmFunc(imports) {
   $0 = FUNCTION_TABLE[HEAP32[HEAP32[$0 + 4 >> 2] + 4 >> 2]]($0, $1, $2, $3) | 0;
   return ($0 ? (($0 | 0) == 1 ? 1 : 5) : 0) | 0;
  }
- 
+
  function read_residual_partitioned_rice_($0, $1, $2, $3, $4, $5) {
   var $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
   $14 = __stack_pointer - 16 | 0;
@@ -14735,12 +14944,12 @@ function asmFunc(imports) {
   __stack_pointer = $14 + 16 | 0;
   return $15;
  }
- 
+
  function FLAC__bitwriter_clear($0) {
   HEAP32[$0 + 12 >> 2] = 0;
   HEAP32[$0 + 16 >> 2] = 0;
  }
- 
+
  function FLAC__bitwriter_get_buffer($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0;
   $6 = HEAP32[$0 + 16 >> 2];
@@ -14801,7 +15010,7 @@ function asmFunc(imports) {
   }
   return $8;
  }
- 
+
  function FLAC__bitwriter_write_zeroes($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   block3 : {
@@ -14916,7 +15125,7 @@ function asmFunc(imports) {
   }
   return $5;
  }
- 
+
  function FLAC__bitwriter_write_raw_uint32($0, $1, $2) {
   var $3 = 0;
   block1 : {
@@ -14930,7 +15139,7 @@ function asmFunc(imports) {
   }
   return $3;
  }
- 
+
  function FLAC__bitwriter_write_raw_uint32_nocheck($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0;
   block : {
@@ -15004,11 +15213,11 @@ function asmFunc(imports) {
   }
   return $7;
  }
- 
+
  function FLAC__bitwriter_write_raw_int32($0, $1, $2) {
   return FLAC__bitwriter_write_raw_uint32_nocheck($0, ($2 >>> 0 >= 32 ? -1 : -1 << $2 ^ -1) & $1, $2);
  }
- 
+
  function FLAC__bitwriter_write_raw_uint64($0, $1, $2, $3) {
   var $4 = 0;
   block2 : {
@@ -15031,7 +15240,7 @@ function asmFunc(imports) {
   }
   return $4;
  }
- 
+
  function FLAC__bitwriter_write_raw_uint32_little_endian($0, $1) {
   var $2 = 0;
   block : {
@@ -15048,7 +15257,7 @@ function asmFunc(imports) {
   }
   return $2;
  }
- 
+
  function FLAC__bitwriter_write_byte_block($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   $4 = HEAP32[$0 + 8 >> 2];
@@ -15107,7 +15316,7 @@ function asmFunc(imports) {
   }
   return $5;
  }
- 
+
  function FLAC__bitwriter_write_unary_unsigned($0, $1) {
   var $2 = 0;
   block1 : {
@@ -15123,7 +15332,7 @@ function asmFunc(imports) {
   }
   return FLAC__bitwriter_write_raw_uint32_nocheck($0, 1, $2);
  }
- 
+
  function FLAC__bitwriter_write_rice_signed_block($0, $1, $2, $3) {
   var $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0;
   $5 = 1;
@@ -15288,12 +15497,12 @@ function asmFunc(imports) {
   }
   return $5;
  }
- 
+
  function FLAC__ogg_encoder_aspect_set_defaults($0) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function simple_ogg_page__init($0) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
@@ -15301,7 +15510,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function simple_ogg_page__clear($0) {
   var $1 = 0;
   $1 = HEAP32[$0 >> 2];
@@ -15318,7 +15527,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = 0;
   HEAP32[$0 + 4 >> 2] = 0;
  }
- 
+
  function simple_ogg_page__get_at($0, $1, $2, $3, $4, $5, $6) {
   var $7 = 0, $8 = 0;
   $7 = __stack_pointer - 16 | 0;
@@ -15434,7 +15643,7 @@ function asmFunc(imports) {
   __stack_pointer = $7 + 16 | 0;
   return $8;
  }
- 
+
  function full_read_($0, $1, $2, $3, $4) {
   var $5 = 0, $6 = 0, $7 = 0;
   $6 = __stack_pointer - 16 | 0;
@@ -15478,7 +15687,7 @@ function asmFunc(imports) {
   __stack_pointer = $6 + 16 | 0;
   return $7;
  }
- 
+
  function simple_ogg_page__set_at($0, $1, $2, $3, $4, $5, $6) {
   block : {
    if (!$4) {
@@ -15508,12 +15717,12 @@ function asmFunc(imports) {
   }
   return 0;
  }
- 
+
  function __emscripten_stdout_close($0) {
   $0 = $0 | 0;
   return 0;
  }
- 
+
  function __emscripten_stdout_seek($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -15522,7 +15731,7 @@ function asmFunc(imports) {
   i64toi32_i32$HIGH_BITS = 0;
   return 0;
  }
- 
+
  function strcmp($0, $1) {
   var $2 = 0, $3 = 0;
   $2 = HEAPU8[$0 | 0];
@@ -15547,7 +15756,7 @@ function asmFunc(imports) {
   }
   return $2 - $3 | 0;
  }
- 
+
  function FLAC__add_metadata_block($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0;
   $3 = strlen(HEAP32[4305]);
@@ -15819,7 +16028,7 @@ function asmFunc(imports) {
   }
   return $16;
  }
- 
+
  function FLAC__frame_add_header($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, wasm2js_i32$0 = 0, wasm2js_i32$1 = 0;
   $4 = __stack_pointer - 16 | 0;
@@ -16179,7 +16388,7 @@ function asmFunc(imports) {
   __stack_pointer = $4 + 16 | 0;
   return $8;
  }
- 
+
  function add_residual_partitioned_rice_($0, $1, $2, $3, $4, $5, $6, $7) {
   var $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0;
   $12 = HEAP32[($7 ? 6752 : 6748) >> 2];
@@ -16272,7 +16481,7 @@ function asmFunc(imports) {
   }
   return 1;
  }
- 
+
  function strncmp($0, $1, $2) {
   var $3 = 0, $4 = 0;
   if (!$2) {
@@ -16305,7 +16514,7 @@ function asmFunc(imports) {
   }
   return $3 - HEAPU8[$1 | 0] | 0;
  }
- 
+
  function __shlim($0) {
   var $1 = 0;
   HEAP32[$0 + 112 >> 2] = 0;
@@ -16315,7 +16524,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 124 >> 2] = $1 >> 31;
   HEAP32[$0 + 104 >> 2] = HEAP32[$0 + 8 >> 2];
  }
- 
+
  function __shgetc($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   $1 = HEAP32[$0 + 4 >> 2];
@@ -16414,7 +16623,7 @@ function asmFunc(imports) {
   }
   return $7;
  }
- 
+
  function __floatsitf($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   $3 = __stack_pointer - 16 | 0;
@@ -16442,7 +16651,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $1;
   __stack_pointer = $3 + 16 | 0;
  }
- 
+
  function __multf3($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0;
   $10 = __stack_pointer - 96 | 0;
@@ -16788,7 +16997,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $13;
   __stack_pointer = $10 + 96 | 0;
  }
- 
+
  function __addtf3($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0;
   $10 = __stack_pointer - 112 | 0;
@@ -17042,7 +17251,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $8;
   __stack_pointer = $10 + 112 | 0;
  }
- 
+
  function __extenddftf2($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   $6 = __stack_pointer - 16 | 0;
@@ -17094,7 +17303,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $4 | ($9 & -2147483648 | $2 << 16);
   __stack_pointer = $6 + 16 | 0;
  }
- 
+
  function __letf2($0, $1, $2, $3, $4, $5, $6, $7) {
   var $8 = 0, $9 = 0, $10 = 0, $11 = 0;
   $9 = 1;
@@ -17125,7 +17334,7 @@ function asmFunc(imports) {
   }
   return $9;
  }
- 
+
  function __getf2($0, $1, $2, $3, $4) {
   var $5 = 0, $6 = 0, $7 = 0;
   $7 = -1;
@@ -17155,7 +17364,7 @@ function asmFunc(imports) {
   }
   return $7;
  }
- 
+
  function scalbn($0, $1) {
   block2 : {
    if (($1 | 0) >= 1024) {
@@ -17183,14 +17392,14 @@ function asmFunc(imports) {
   wasm2js_scratch_store_i32(1, $1 + 1023 << 20);
   return $0 * +wasm2js_scratch_load_f64();
  }
- 
+
  function copysignl($0, $1, $2, $3, $4, $5) {
   HEAP32[$0 >> 2] = $1;
   HEAP32[$0 + 4 >> 2] = $2;
   HEAP32[$0 + 8 >> 2] = $3;
   HEAP32[$0 + 12 >> 2] = $4 & 65535 | ($5 >>> 16 & 32768 | ($4 & 2147418112) >>> 16) << 16;
  }
- 
+
  function __floatunsitf($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = 0;
   $2 = __stack_pointer - 16 | 0;
@@ -17216,7 +17425,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $1;
   __stack_pointer = $2 + 16 | 0;
  }
- 
+
  function __subtf3($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0;
   $9 = __stack_pointer - 16 | 0;
@@ -17231,7 +17440,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 4 >> 2] = $2;
   __stack_pointer = $9 + 16 | 0;
  }
- 
+
  function scalbnl($0, $1, $2, $3, $4, $5) {
   var $6 = 0;
   $6 = __stack_pointer - 80 | 0;
@@ -17283,7 +17492,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 4 >> 2] = $1;
   __stack_pointer = $6 + 80 | 0;
  }
- 
+
  function __multi3($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0, $10 = 0, $11 = 0, $12 = 0;
   $7 = __wasm_i64_mul($7, $8, $1, $2);
@@ -17326,7 +17535,7 @@ function asmFunc(imports) {
   HEAP32[$0 >> 2] = $8;
   HEAP32[$0 + 4 >> 2] = $1;
  }
- 
+
  function __divtf3($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $40 = 0;
   $10 = __stack_pointer - 336 | 0;
@@ -17854,7 +18063,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $19;
   __stack_pointer = $10 + 336 | 0;
  }
- 
+
  function fmodl($0, $1, $2, $3, $4, $5, $6, $7, $8) {
   var $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0;
   $9 = __stack_pointer - 128 | 0;
@@ -18036,7 +18245,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 12 >> 2] = $4;
   __stack_pointer = $9 + 128 | 0;
  }
- 
+
  function scanexp($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0;
   block18 : {
@@ -18178,7 +18387,7 @@ function asmFunc(imports) {
   i64toi32_i32$HIGH_BITS = $3;
   return $2;
  }
- 
+
  function strtod($0) {
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0.0;
   $26 = __stack_pointer - 16 | 0;
@@ -19547,21 +19756,21 @@ function asmFunc(imports) {
   __stack_pointer = $26 + 16 | 0;
   return $29;
  }
- 
+
  function __cosdf($0) {
   var $1 = 0.0;
   $0 = $0 * $0;
   $1 = $0 * $0;
   return Math_fround($0 * $1 * ($0 * 2.439044879627741e-05 + -.001388676377460993) + ($1 * .04166662332373906 + ($0 * -.499999997251031 + 1.0)));
  }
- 
+
  function __sindf($0) {
   var $1 = 0.0, $2 = 0.0;
   $1 = $0 * $0;
   $2 = $0 * $1;
   return Math_fround($2 * ($1 * $1) * ($1 * 2.718311493989822e-06 + -1.9839334836096632e-04) + ($2 * ($1 * .008333329385889463 + -.16666666641626524) + $0));
  }
- 
+
  function cosf($0) {
   var $1 = 0, $2 = 0.0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = Math_fround(0), $8 = 0, $9 = 0.0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0.0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0;
   $17 = __stack_pointer - 16 | 0;
@@ -19992,11 +20201,11 @@ function asmFunc(imports) {
   __stack_pointer = $17 + 16 | 0;
   return $0;
  }
- 
+
  function __math_xflow($0) {
   return $0 * fp_barrier($0);
  }
- 
+
  function exp($0) {
   var $1 = 0.0, $2 = 0, $3 = 0.0, $4 = 0, $5 = 0, $6 = 0.0, $7 = 0;
   block3 : {
@@ -20076,7 +20285,7 @@ function asmFunc(imports) {
   }
   return $3;
  }
- 
+
  function top12($0) {
   var $1 = 0;
   wasm2js_scratch_store_f64(+$0);
@@ -20084,7 +20293,7 @@ function asmFunc(imports) {
   wasm2js_scratch_load_i32(0) | 0;
   return $1 >>> 20 | 0;
  }
- 
+
  function FLAC__stream_encoder_new() {
   var $0 = 0, $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0;
   $3 = emscripten_builtin_calloc(1, 8);
@@ -20262,7 +20471,7 @@ function asmFunc(imports) {
   emscripten_builtin_free($3);
   return 0;
  }
- 
+
  function FLAC__stream_encoder_set_apodization($0, $1) {
   var $2 = 0, $3 = 0, $4 = 0, $5 = Math_fround(0), $6 = 0, $7 = 0.0, $8 = Math_fround(0), $9 = Math_fround(0), $10 = 0, $11 = 0;
   $2 = HEAP32[$0 >> 2];
@@ -20595,7 +20804,7 @@ function asmFunc(imports) {
   }
   return $4;
  }
- 
+
  function FLAC__stream_encoder_delete($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0;
@@ -20636,7 +20845,7 @@ function asmFunc(imports) {
    emscripten_builtin_free($0);
   }
  }
- 
+
  function FLAC__stream_encoder_finish($0) {
   $0 = $0 | 0;
   var $1 = 0, $2 = 0, $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0;
@@ -21300,7 +21509,7 @@ function asmFunc(imports) {
   __stack_pointer = $9 + 16 | 0;
   return $1 | 0;
  }
- 
+
  function process_frame_($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0;
   $10 = __stack_pointer - 48 | 0;
@@ -21872,7 +22081,7 @@ function asmFunc(imports) {
   __stack_pointer = $10 + 48 | 0;
   return $5;
  }
- 
+
  function FLAC__stream_encoder_init_stream($0, $1, $2, $3, $4, $5) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -21882,7 +22091,7 @@ function asmFunc(imports) {
   $5 = $5 | 0;
   return init_stream_internal__301($0, 0, $1, $2, $3, $4, $5, 0) | 0;
  }
- 
+
  function init_stream_internal__301($0, $1, $2, $3, $4, $5, $6, $7) {
   var $8 = 0, $9 = 0, $10 = 0, $11 = 0.0, $12 = 0, $13 = Math_fround(0), $14 = Math_fround(0), $15 = 0, $16 = 0, $17 = 0.0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = Math_fround(0), $27 = Math_fround(0), $28 = 0.0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, wasm2js_i32$0 = 0, wasm2js_f32$0 = Math_fround(0);
   $24 = __stack_pointer - 176 | 0;
@@ -24481,7 +24690,7 @@ function asmFunc(imports) {
   __stack_pointer = $24 + 176 | 0;
   return $16;
  }
- 
+
  function precompute_partition_info_sums_($0, $1, $2, $3, $4, $5, $6) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -24687,7 +24896,7 @@ function asmFunc(imports) {
    };
   }
  }
- 
+
  function verify_read_callback_($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -24723,7 +24932,7 @@ function asmFunc(imports) {
   HEAP32[$0 + 11812 >> 2] = HEAP32[$0 + 11812 >> 2] - $1;
   return 0;
  }
- 
+
  function verify_write_callback_($0, $1, $2, $3) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -24830,20 +25039,20 @@ function asmFunc(imports) {
   }
   return 0;
  }
- 
+
  function verify_metadata_callback_($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
   $2 = $2 | 0;
  }
- 
+
  function verify_error_callback_($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
   $2 = $2 | 0;
   HEAP32[HEAP32[$2 >> 2] >> 2] = 3;
  }
- 
+
  function write_bitbuffer_($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0;
   $13 = __stack_pointer - 16 | 0;
@@ -25366,7 +25575,7 @@ function asmFunc(imports) {
   __stack_pointer = $13 + 16 | 0;
   return $9;
  }
- 
+
  function FLAC__stream_encoder_init_ogg_stream($0, $1, $2, $3, $4, $5, $6) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -25377,7 +25586,7 @@ function asmFunc(imports) {
   $6 = $6 | 0;
   return init_stream_internal__301($0, $1, $2, $3, $4, $5, $6, 1) | 0;
  }
- 
+
  function process_subframe_($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) {
   var $11 = 0, $12 = 0, $13 = 0, $14 = 0, $15 = 0.0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0.0, $23 = 0, $24 = 0, $25 = 0, $26 = 0.0, $27 = 0, $28 = 0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = Math_fround(0), $37 = 0, $38 = 0, $39 = 0.0, $40 = 0.0, $41 = 0, $42 = Math_fround(0), $43 = 0, $44 = 0, $45 = 0.0, $46 = 0, $47 = 0, $48 = 0, $49 = 0, $50 = 0, $51 = 0, $52 = 0, $53 = 0, $54 = 0, $55 = 0, $56 = 0, $57 = 0, $58 = 0, $59 = 0, $60 = 0, $61 = 0, $62 = 0, $63 = 0;
   $24 = __stack_pointer - 576 | 0;
@@ -26169,7 +26378,7 @@ function asmFunc(imports) {
   HEAP32[$10 >> 2] = $27;
   __stack_pointer = $24 + 576 | 0;
  }
- 
+
  function add_subframe_($0, $1, $2, $3, $4) {
   var $5 = 0, $6 = 0, $7 = 0, $8 = 0;
   $8 = 1;
@@ -26385,7 +26594,7 @@ function asmFunc(imports) {
   }
   return $8;
  }
- 
+
  function FLAC__stream_encoder_set_ogg_serial_number($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26398,7 +26607,7 @@ function asmFunc(imports) {
   }
   return $0 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_verify($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26410,7 +26619,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_channels($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26422,7 +26631,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_bits_per_sample($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26434,7 +26643,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_sample_rate($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26446,7 +26655,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_compression_level($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26475,7 +26684,7 @@ function asmFunc(imports) {
   }
   return $4 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_blocksize($0, $1) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26487,7 +26696,7 @@ function asmFunc(imports) {
   }
   return $2 | 0;
  }
- 
+
  function FLAC__stream_encoder_set_metadata($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26526,7 +26735,7 @@ function asmFunc(imports) {
   }
   return ($0 | 0) != 0 | 0;
  }
- 
+
  function FLAC__stream_encoder_get_verify_decoder_state($0) {
   $0 = $0 | 0;
   if (!HEAP32[HEAP32[$0 >> 2] + 4 >> 2]) {
@@ -26534,12 +26743,12 @@ function asmFunc(imports) {
   }
   return FLAC__stream_decoder_get_state(HEAP32[HEAP32[$0 + 4 >> 2] + 11752 >> 2]) | 0;
  }
- 
+
  function FLAC__stream_encoder_get_verify($0) {
   $0 = $0 | 0;
   return HEAP32[HEAP32[$0 >> 2] + 4 >> 2];
  }
- 
+
  function FLAC__stream_encoder_process($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26719,7 +26928,7 @@ function asmFunc(imports) {
   }
   return $4 | 0;
  }
- 
+
  function FLAC__stream_encoder_process_interleaved($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -26994,7 +27203,7 @@ function asmFunc(imports) {
   }
   return $12 | 0;
  }
- 
+
  function find_best_partition_order_($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) {
   var $13 = 0, $14 = 0, $15 = 0, $16 = 0, $17 = 0, $18 = 0, $19 = 0, $20 = 0, $21 = 0, $22 = 0, $23 = 0, $24 = 0, $25 = 0, $26 = 0, $27 = 0, $28 = 0, $29 = 0, $30 = 0, $31 = 0, $32 = 0, $33 = 0, $34 = 0, $35 = 0, $36 = 0, $37 = 0, $38 = 0, $39 = 0, $40 = 0, $41 = 0, $42 = 0, $43 = 0;
   $32 = $4 + $5 | 0;
@@ -27335,23 +27544,23 @@ function asmFunc(imports) {
   }
   return $25;
  }
- 
+
  function _emscripten_stack_restore($0) {
   $0 = $0 | 0;
   __stack_pointer = $0;
  }
- 
+
  function _emscripten_stack_alloc($0) {
   $0 = $0 | 0;
   $0 = __stack_pointer - $0 & -16;
   __stack_pointer = $0;
   return $0 | 0;
  }
- 
+
  function emscripten_stack_get_current() {
   return __stack_pointer | 0;
  }
- 
+
  function legalstub$FLAC__stream_encoder_set_total_samples_estimate($0, $1, $2) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -27380,7 +27589,7 @@ function asmFunc(imports) {
   }
   return $0 | 0;
  }
- 
+
  function legalstub$dynCall_jiji($0, $1, $2, $3, $4) {
   $0 = $0 | 0;
   $1 = $1 | 0;
@@ -27389,7 +27598,7 @@ function asmFunc(imports) {
   $4 = $4 | 0;
   return FUNCTION_TABLE[$0 | 0]($1, $2, $3, $4) | 0;
  }
- 
+
  function _ZN17compiler_builtins3int4udiv10divmod_u6417h6026910b5ed08e40E($0, $1, $2) {
   var $3 = 0, $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0, $10 = 0, $11 = 0;
   label$1 : {
@@ -27510,14 +27719,14 @@ function asmFunc(imports) {
   i64toi32_i32$HIGH_BITS = $1;
   return $0;
  }
- 
+
  function __wasm_ctz_i32($0) {
   if ($0) {
    return 31 - Math_clz32($0 - 1 ^ $0) | 0
   }
   return 32;
  }
- 
+
  function __wasm_i64_mul($0, $1, $2, $3) {
   var $4 = 0, $5 = 0, $6 = 0, $7 = 0, $8 = 0, $9 = 0;
   $4 = $2 >>> 16 | 0;
@@ -27531,17 +27740,17 @@ function asmFunc(imports) {
   i64toi32_i32$HIGH_BITS = (Math_imul($1, $2) + $9 | 0) + Math_imul($0, $3) + ($5 >>> 16) + ($4 >>> 16) | 0;
   return $8 & 65535 | $4 << 16;
  }
- 
+
  function __wasm_i64_udiv($0, $1, $2) {
   return _ZN17compiler_builtins3int4udiv10divmod_u6417h6026910b5ed08e40E($0, $1, $2);
  }
- 
+
  function __wasm_i64_urem($0, $1) {
   _ZN17compiler_builtins3int4udiv10divmod_u6417h6026910b5ed08e40E($0, $1, 588);
   i64toi32_i32$HIGH_BITS = __wasm_intrinsics_temp_i64$hi;
   return __wasm_intrinsics_temp_i64;
  }
- 
+
  function __wasm_rotl_i32($0, $1) {
   var $2 = 0, $3 = 0;
   $2 = $1 & 31;
@@ -27550,7 +27759,7 @@ function asmFunc(imports) {
   $0 = 0 - $1 & 31;
   return $3 | ($2 & -1 << $0) >>> $0;
  }
- 
+
  // EMSCRIPTEN_END_FUNCS
 ;
  bufferView = HEAPU8;
@@ -27559,7 +27768,7 @@ function asmFunc(imports) {
  function __wasm_memory_size() {
   return buffer.byteLength / 65536 | 0;
  }
- 
+
  function __wasm_memory_grow(pagesToAdd) {
   pagesToAdd = pagesToAdd | 0;
   var oldPages = __wasm_memory_size() | 0;
@@ -27581,62 +27790,62 @@ function asmFunc(imports) {
   }
   return oldPages;
  }
- 
+
  return {
   "memory": Object.create(Object.prototype, {
    "grow": {
     "value": __wasm_memory_grow
-   }, 
+   },
    "buffer": {
     "get": function () {
      return buffer;
     }
-    
+
    }
-  }), 
-  "__wasm_call_ctors": __wasm_call_ctors, 
-  "FLAC__stream_decoder_new": FLAC__stream_decoder_new, 
-  "FLAC__stream_decoder_delete": FLAC__stream_decoder_delete, 
-  "FLAC__stream_decoder_finish": FLAC__stream_decoder_finish, 
-  "FLAC__stream_decoder_init_stream": FLAC__stream_decoder_init_stream, 
-  "FLAC__stream_decoder_reset": FLAC__stream_decoder_reset, 
-  "FLAC__stream_decoder_init_ogg_stream": FLAC__stream_decoder_init_ogg_stream, 
-  "FLAC__stream_decoder_set_ogg_serial_number": FLAC__stream_decoder_set_ogg_serial_number, 
-  "FLAC__stream_decoder_set_md5_checking": FLAC__stream_decoder_set_md5_checking, 
-  "FLAC__stream_decoder_set_metadata_respond": FLAC__stream_decoder_set_metadata_respond, 
-  "FLAC__stream_decoder_set_metadata_respond_application": FLAC__stream_decoder_set_metadata_respond_application, 
-  "FLAC__stream_decoder_set_metadata_respond_all": FLAC__stream_decoder_set_metadata_respond_all, 
-  "FLAC__stream_decoder_set_metadata_ignore": FLAC__stream_decoder_set_metadata_ignore, 
-  "FLAC__stream_decoder_set_metadata_ignore_application": FLAC__stream_decoder_set_metadata_ignore_application, 
-  "FLAC__stream_decoder_set_metadata_ignore_all": FLAC__stream_decoder_set_metadata_ignore_all, 
-  "FLAC__stream_decoder_get_state": FLAC__stream_decoder_get_state, 
-  "FLAC__stream_decoder_get_md5_checking": FLAC__stream_decoder_get_md5_checking, 
-  "FLAC__stream_decoder_process_single": FLAC__stream_decoder_process_single, 
-  "FLAC__stream_decoder_process_until_end_of_metadata": FLAC__stream_decoder_process_until_end_of_metadata, 
-  "FLAC__stream_decoder_process_until_end_of_stream": FLAC__stream_decoder_process_until_end_of_stream, 
-  "FLAC__stream_encoder_new": FLAC__stream_encoder_new, 
-  "FLAC__stream_encoder_delete": FLAC__stream_encoder_delete, 
-  "FLAC__stream_encoder_finish": FLAC__stream_encoder_finish, 
-  "FLAC__stream_encoder_init_stream": FLAC__stream_encoder_init_stream, 
-  "FLAC__stream_encoder_init_ogg_stream": FLAC__stream_encoder_init_ogg_stream, 
-  "FLAC__stream_encoder_set_ogg_serial_number": FLAC__stream_encoder_set_ogg_serial_number, 
-  "FLAC__stream_encoder_set_verify": FLAC__stream_encoder_set_verify, 
-  "FLAC__stream_encoder_set_channels": FLAC__stream_encoder_set_channels, 
-  "FLAC__stream_encoder_set_bits_per_sample": FLAC__stream_encoder_set_bits_per_sample, 
-  "FLAC__stream_encoder_set_sample_rate": FLAC__stream_encoder_set_sample_rate, 
-  "FLAC__stream_encoder_set_compression_level": FLAC__stream_encoder_set_compression_level, 
-  "FLAC__stream_encoder_set_blocksize": FLAC__stream_encoder_set_blocksize, 
-  "FLAC__stream_encoder_set_total_samples_estimate": legalstub$FLAC__stream_encoder_set_total_samples_estimate, 
-  "FLAC__stream_encoder_set_metadata": FLAC__stream_encoder_set_metadata, 
-  "FLAC__stream_encoder_get_state": FLAC__stream_decoder_get_state, 
-  "FLAC__stream_encoder_get_verify_decoder_state": FLAC__stream_encoder_get_verify_decoder_state, 
-  "FLAC__stream_encoder_get_verify": FLAC__stream_encoder_get_verify, 
-  "FLAC__stream_encoder_process": FLAC__stream_encoder_process, 
-  "FLAC__stream_encoder_process_interleaved": FLAC__stream_encoder_process_interleaved, 
-  "_emscripten_stack_restore": _emscripten_stack_restore, 
-  "_emscripten_stack_alloc": _emscripten_stack_alloc, 
-  "emscripten_stack_get_current": emscripten_stack_get_current, 
-  "__indirect_function_table": FUNCTION_TABLE, 
+  }),
+  "__wasm_call_ctors": __wasm_call_ctors,
+  "FLAC__stream_decoder_new": FLAC__stream_decoder_new,
+  "FLAC__stream_decoder_delete": FLAC__stream_decoder_delete,
+  "FLAC__stream_decoder_finish": FLAC__stream_decoder_finish,
+  "FLAC__stream_decoder_init_stream": FLAC__stream_decoder_init_stream,
+  "FLAC__stream_decoder_reset": FLAC__stream_decoder_reset,
+  "FLAC__stream_decoder_init_ogg_stream": FLAC__stream_decoder_init_ogg_stream,
+  "FLAC__stream_decoder_set_ogg_serial_number": FLAC__stream_decoder_set_ogg_serial_number,
+  "FLAC__stream_decoder_set_md5_checking": FLAC__stream_decoder_set_md5_checking,
+  "FLAC__stream_decoder_set_metadata_respond": FLAC__stream_decoder_set_metadata_respond,
+  "FLAC__stream_decoder_set_metadata_respond_application": FLAC__stream_decoder_set_metadata_respond_application,
+  "FLAC__stream_decoder_set_metadata_respond_all": FLAC__stream_decoder_set_metadata_respond_all,
+  "FLAC__stream_decoder_set_metadata_ignore": FLAC__stream_decoder_set_metadata_ignore,
+  "FLAC__stream_decoder_set_metadata_ignore_application": FLAC__stream_decoder_set_metadata_ignore_application,
+  "FLAC__stream_decoder_set_metadata_ignore_all": FLAC__stream_decoder_set_metadata_ignore_all,
+  "FLAC__stream_decoder_get_state": FLAC__stream_decoder_get_state,
+  "FLAC__stream_decoder_get_md5_checking": FLAC__stream_decoder_get_md5_checking,
+  "FLAC__stream_decoder_process_single": FLAC__stream_decoder_process_single,
+  "FLAC__stream_decoder_process_until_end_of_metadata": FLAC__stream_decoder_process_until_end_of_metadata,
+  "FLAC__stream_decoder_process_until_end_of_stream": FLAC__stream_decoder_process_until_end_of_stream,
+  "FLAC__stream_encoder_new": FLAC__stream_encoder_new,
+  "FLAC__stream_encoder_delete": FLAC__stream_encoder_delete,
+  "FLAC__stream_encoder_finish": FLAC__stream_encoder_finish,
+  "FLAC__stream_encoder_init_stream": FLAC__stream_encoder_init_stream,
+  "FLAC__stream_encoder_init_ogg_stream": FLAC__stream_encoder_init_ogg_stream,
+  "FLAC__stream_encoder_set_ogg_serial_number": FLAC__stream_encoder_set_ogg_serial_number,
+  "FLAC__stream_encoder_set_verify": FLAC__stream_encoder_set_verify,
+  "FLAC__stream_encoder_set_channels": FLAC__stream_encoder_set_channels,
+  "FLAC__stream_encoder_set_bits_per_sample": FLAC__stream_encoder_set_bits_per_sample,
+  "FLAC__stream_encoder_set_sample_rate": FLAC__stream_encoder_set_sample_rate,
+  "FLAC__stream_encoder_set_compression_level": FLAC__stream_encoder_set_compression_level,
+  "FLAC__stream_encoder_set_blocksize": FLAC__stream_encoder_set_blocksize,
+  "FLAC__stream_encoder_set_total_samples_estimate": legalstub$FLAC__stream_encoder_set_total_samples_estimate,
+  "FLAC__stream_encoder_set_metadata": FLAC__stream_encoder_set_metadata,
+  "FLAC__stream_encoder_get_state": FLAC__stream_decoder_get_state,
+  "FLAC__stream_encoder_get_verify_decoder_state": FLAC__stream_encoder_get_verify_decoder_state,
+  "FLAC__stream_encoder_get_verify": FLAC__stream_encoder_get_verify,
+  "FLAC__stream_encoder_process": FLAC__stream_encoder_process,
+  "FLAC__stream_encoder_process_interleaved": FLAC__stream_encoder_process_interleaved,
+  "_emscripten_stack_restore": _emscripten_stack_restore,
+  "_emscripten_stack_alloc": _emscripten_stack_alloc,
+  "emscripten_stack_get_current": emscripten_stack_get_current,
+  "__indirect_function_table": FUNCTION_TABLE,
   "dynCall_jiji": legalstub$dynCall_jiji
  };
 }
@@ -27779,7 +27988,7 @@ function preRun() {
 function initRuntime() {
   runtimeInitialized = true;
 
-  
+
 if (!Module['noFSInit'] && !FS.initialized)
   FS.init();
 FS.ignorePermissions = false;
@@ -27979,10 +28188,10 @@ async function createWasm() {
   function receiveInstance(instance, module) {
     wasmExports = instance.exports;
 
-    
+
 
     wasmMemory = wasmExports['memory'];
-    
+
     updateMemoryViews();
 
     addOnInit(wasmExports['__wasm_call_ctors']);
@@ -28049,7 +28258,7 @@ var tempI64;
       }
     };
 
-  
+
     /**
      * @param {number} ptr
      * @param {string} type
@@ -28071,7 +28280,7 @@ var tempI64;
 
   var noExitRuntime = Module['noExitRuntime'] || true;
 
-  
+
     /**
      * @param {number} ptr
      * @param {number} value
@@ -28102,11 +28311,11 @@ var tempI64;
       // for any code that deals with heap sizes, which would require special
       // casing all heap size related code to treat 0 specially.
       2147483648;
-  
+
   var alignMemory = (size, alignment) => {
       return Math.ceil(size / alignment) * alignment;
     };
-  
+
   var growMemory = (size) => {
       var b = wasmMemory.buffer;
       var pages = ((size - b.byteLength + 65535) / 65536) | 0;
@@ -28126,7 +28335,7 @@ var tempI64;
       requestedSize >>>= 0;
       // With multithreaded builds, races can happen (another thread might increase the size
       // in between), so return a failure, and let the caller retry.
-  
+
       // Memory resize rules:
       // 1.  Always increase heap size to at least the requested size, rounded up
       //     to next page multiple.
@@ -28143,14 +28352,14 @@ var tempI64;
       //     over-eager decision to excessively reserve due to (3) above.
       //     Hence if an allocation fails, cut down on the amount of excess
       //     growth, in an attempt to succeed to perform a smaller allocation.
-  
+
       // A limit is set for how much we can grow. We should not exceed that
       // (the wasm binary specifies it, so if we tried, we'd fail anyhow).
       var maxHeapSize = getHeapMax();
       if (requestedSize > maxHeapSize) {
         return false;
       }
-  
+
       // Loop through potential heap size increases. If we attempt a too eager
       // reservation that fails, cut down on the attempted size and reserve a
       // smaller bump instead. (max 3 times, chosen somewhat arbitrarily)
@@ -28158,12 +28367,12 @@ var tempI64;
         var overGrownHeapSize = oldSize * (1 + 0.2 / cutDown); // ensure geometric growth
         // but limit overreserving (default to capping at +96MB overgrowth at most)
         overGrownHeapSize = Math.min(overGrownHeapSize, requestedSize + 100663296 );
-  
+
         var newSize = Math.min(maxHeapSize, alignMemory(Math.max(requestedSize, overGrownHeapSize), 65536));
-  
+
         var replacement = growMemory(newSize);
         if (replacement) {
-  
+
           return true;
         }
       }
@@ -28230,23 +28439,23 @@ var tempI64;
   join:(...paths) => PATH.normalize(paths.join('/')),
   join2:(l, r) => PATH.normalize(l + '/' + r),
   };
-  
+
   var initRandomFill = () => {
       // This block is not needed on v19+ since crypto.getRandomValues is builtin
       if (ENVIRONMENT_IS_NODE) {
         var nodeCrypto = require('crypto');
         return (view) => nodeCrypto.randomFillSync(view);
       }
-  
+
       return (view) => crypto.getRandomValues(view);
     };
   var randomFill = (view) => {
       // Lazily init on the first invocation.
       (randomFill = initRandomFill())(view);
     };
-  
-  
-  
+
+
+
   var PATH_FS = {
   resolve:(...args) => {
         var resolvedPath = '',
@@ -28300,10 +28509,10 @@ var tempI64;
         return outputParts.join('/');
       },
   };
-  
-  
+
+
   var UTF8Decoder = typeof TextDecoder != 'undefined' ? new TextDecoder() : undefined;
-  
+
     /**
      * Given a pointer 'idx' to a null-terminated UTF8-encoded string in the given
      * array that contains uint8 values, returns a copy of that string as a
@@ -28322,7 +28531,7 @@ var tempI64;
       // (As a tiny code save trick, compare endPtr against endIdx using a negation,
       // so that undefined/NaN means Infinity)
       while (heapOrArray[endPtr] && !(endPtr >= endIdx)) ++endPtr;
-  
+
       if (endPtr - idx > 16 && heapOrArray.buffer && UTF8Decoder) {
         return UTF8Decoder.decode(heapOrArray.subarray(idx, endPtr));
       }
@@ -28344,7 +28553,7 @@ var tempI64;
         } else {
           u0 = ((u0 & 7) << 18) | (u1 << 12) | (u2 << 6) | (heapOrArray[idx++] & 63);
         }
-  
+
         if (u0 < 0x10000) {
           str += String.fromCharCode(u0);
         } else {
@@ -28354,9 +28563,9 @@ var tempI64;
       }
       return str;
     };
-  
+
   var FS_stdin_getChar_buffer = [];
-  
+
   var lengthBytesUTF8 = (str) => {
       var len = 0;
       for (var i = 0; i < str.length; ++i) {
@@ -28377,13 +28586,13 @@ var tempI64;
       }
       return len;
     };
-  
+
   var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
       // Parameter maxBytesToWrite is not optional. Negative values, 0, null,
       // undefined and false each don't write out any bytes.
       if (!(maxBytesToWrite > 0))
         return 0;
-  
+
       var startIdx = outIdx;
       var endIdx = outIdx + maxBytesToWrite - 1; // -1 for string null terminator.
       for (var i = 0; i < str.length; ++i) {
@@ -28439,7 +28648,7 @@ var tempI64;
           var BUFSIZE = 256;
           var buf = Buffer.alloc(BUFSIZE);
           var bytesRead = 0;
-  
+
           // For some reason we must suppress a closure warning here, even though
           // fd definitely exists on process.stdin, and is even the proper way to
           // get the fd of stdin,
@@ -28448,7 +28657,7 @@ var tempI64;
           // so it is related to the surrounding code in some unclear manner.
           /** @suppress {missingProperties} */
           var fd = process.stdin.fd;
-  
+
           try {
             bytesRead = fs.readSync(fd, buf, 0, BUFSIZE);
           } catch(e) {
@@ -28458,7 +28667,7 @@ var tempI64;
             if (e.toString().includes('EOF')) bytesRead = 0;
             else throw e;
           }
-  
+
           if (bytesRead > 0) {
             result = buf.slice(0, bytesRead).toString('utf-8');
           }
@@ -28620,12 +28829,12 @@ var tempI64;
         },
   },
   };
-  
-  
+
+
   var zeroMemory = (address, size) => {
       HEAPU8.fill(0, address, address + size);
     };
-  
+
   var mmapAlloc = (size) => {
       abort();
     };
@@ -28698,7 +28907,7 @@ var tempI64;
           // When the byte data of the file is populated, this will point to either a typed array, or a normal JS array. Typed arrays are preferred
           // for performance, and used by default. However, typed arrays are not resizable like normal JS arrays are, so there is a small disk size
           // penalty involved for appending file writes that continuously grow a file similar to std::vector capacity vs used -scheme.
-          node.contents = null; 
+          node.contents = null;
         } else if (FS.isLink(node.mode)) {
           node.node_ops = MEMFS.ops_table.link.node;
           node.stream_ops = MEMFS.ops_table.link.stream;
@@ -28858,11 +29067,11 @@ var tempI64;
           if (buffer.buffer === HEAP8.buffer) {
             canOwn = false;
           }
-  
+
           if (!length) return 0;
           var node = stream.node;
           node.mtime = node.ctime = Date.now();
-  
+
           if (buffer.subarray && (!node.contents || node.contents.subarray)) { // This write is from a typed array to a typed array?
             if (canOwn) {
               node.contents = buffer.subarray(offset, offset + length);
@@ -28877,7 +29086,7 @@ var tempI64;
               return length;
             }
           }
-  
+
           // Appending to an existing file and we need to reallocate, or source data did not come as a typed array.
           MEMFS.expandFileStorage(node, position+length);
           if (node.contents.subarray && buffer.subarray) {
@@ -28949,22 +29158,22 @@ var tempI64;
         },
   },
   };
-  
+
   var asyncLoad = async (url) => {
       var arrayBuffer = await readAsync(url);
       return new Uint8Array(arrayBuffer);
     };
-  
-  
+
+
   var FS_createDataFile = (parent, name, fileData, canRead, canWrite, canOwn) => {
       FS.createDataFile(parent, name, fileData, canRead, canWrite, canOwn);
     };
-  
+
   var preloadPlugins = Module['preloadPlugins'] || [];
   var FS_handledByPreloadPlugin = (byteArray, fullname, finish, onerror) => {
       // Ensure plugins are ready.
       if (typeof Browser != 'undefined') Browser.init();
-  
+
       var handled = false;
       preloadPlugins.forEach((plugin) => {
         if (handled) return;
@@ -29004,7 +29213,7 @@ var tempI64;
         processData(url);
       }
     };
-  
+
   var FS_modeStringToFlags = (str) => {
       var flagModes = {
         'r': 0,
@@ -29020,16 +29229,16 @@ var tempI64;
       }
       return flags;
     };
-  
+
   var FS_getMode = (canRead, canWrite) => {
       var mode = 0;
       if (canRead) mode |= 292 | 73;
       if (canWrite) mode |= 146;
       return mode;
     };
-  
-  
-  
+
+
+
   var FS = {
   root:null,
   mounts:[],
@@ -29129,37 +29338,37 @@ var tempI64;
           throw new FS.ErrnoError(44);
         }
         opts.follow_mount ??= true
-  
+
         if (!PATH.isAbs(path)) {
           path = FS.cwd() + '/' + path;
         }
-  
+
         // limit max consecutive symlinks to 40 (SYMLOOP_MAX).
         linkloop: for (var nlinks = 0; nlinks < 40; nlinks++) {
           // split the absolute path
           var parts = path.split('/').filter((p) => !!p);
-  
+
           // start at the root
           var current = FS.root;
           var current_path = '/';
-  
+
           for (var i = 0; i < parts.length; i++) {
             var islast = (i === parts.length-1);
             if (islast && opts.parent) {
               // stop resolving
               break;
             }
-  
+
             if (parts[i] === '.') {
               continue;
             }
-  
+
             if (parts[i] === '..') {
               current_path = PATH.dirname(current_path);
               current = current.parent;
               continue;
             }
-  
+
             current_path = PATH.join2(current_path, parts[i]);
             try {
               current = FS.lookupNode(current, parts[i]);
@@ -29172,12 +29381,12 @@ var tempI64;
               }
               throw e;
             }
-  
+
             // jump to the mount's root node if this is a mountpoint
             if (FS.isMountpoint(current) && (!islast || opts.follow_mount)) {
               current = current.mounted.root;
             }
-  
+
             // by default, lookupPath will not follow a symlink if it is the final path component.
             // setting opts.follow = true will override this behavior.
             if (FS.isLink(current.mode) && (!islast || opts.follow)) {
@@ -29210,7 +29419,7 @@ var tempI64;
       },
   hashName(parentid, name) {
         var hash = 0;
-  
+
         for (var i = 0; i < name.length; i++) {
           hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
         }
@@ -29253,9 +29462,9 @@ var tempI64;
       },
   createNode(parent, name, mode, rdev) {
         var node = new FS.FSNode(parent, name, mode, rdev);
-  
+
         FS.hashAddNode(node);
-  
+
         return node;
       },
   destroyNode(node) {
@@ -29390,7 +29599,7 @@ var tempI64;
       },
   getStream:(fd) => FS.streams[fd],
   createStream(stream, fd = -1) {
-  
+
         // clone it, so we can return an instance of FSStream
         stream = Object.assign(new FS.FSStream(), stream);
         if (fd == -1) {
@@ -29437,15 +29646,15 @@ var tempI64;
   getMounts(mount) {
         var mounts = [];
         var check = [mount];
-  
+
         while (check.length) {
           var m = check.pop();
-  
+
           mounts.push(m);
-  
+
           check.push(...m.mounts);
         }
-  
+
         return mounts;
       },
   syncfs(populate, callback) {
@@ -29453,21 +29662,21 @@ var tempI64;
           callback = populate;
           populate = false;
         }
-  
+
         FS.syncFSRequests++;
-  
+
         if (FS.syncFSRequests > 1) {
           err(`warning: ${FS.syncFSRequests} FS.syncfs operations in flight at once, probably just doing extra work`);
         }
-  
+
         var mounts = FS.getMounts(FS.root.mount);
         var completed = 0;
-  
+
         function doCallback(errCode) {
           FS.syncFSRequests--;
           return callback(errCode);
         }
-  
+
         function done(errCode) {
           if (errCode) {
             if (!done.errored) {
@@ -29480,7 +29689,7 @@ var tempI64;
             doCallback(null);
           }
         };
-  
+
         // sync all mounts
         mounts.forEach((mount) => {
           if (!mount.type.syncfs) {
@@ -29493,79 +29702,79 @@ var tempI64;
         var root = mountpoint === '/';
         var pseudo = !mountpoint;
         var node;
-  
+
         if (root && FS.root) {
           throw new FS.ErrnoError(10);
         } else if (!root && !pseudo) {
           var lookup = FS.lookupPath(mountpoint, { follow_mount: false });
-  
+
           mountpoint = lookup.path;  // use the absolute path
           node = lookup.node;
-  
+
           if (FS.isMountpoint(node)) {
             throw new FS.ErrnoError(10);
           }
-  
+
           if (!FS.isDir(node.mode)) {
             throw new FS.ErrnoError(54);
           }
         }
-  
+
         var mount = {
           type,
           opts,
           mountpoint,
           mounts: []
         };
-  
+
         // create a root node for the fs
         var mountRoot = type.mount(mount);
         mountRoot.mount = mount;
         mount.root = mountRoot;
-  
+
         if (root) {
           FS.root = mountRoot;
         } else if (node) {
           // set as a mountpoint
           node.mounted = mount;
-  
+
           // add the new mount to the current mount's children
           if (node.mount) {
             node.mount.mounts.push(mount);
           }
         }
-  
+
         return mountRoot;
       },
   unmount(mountpoint) {
         var lookup = FS.lookupPath(mountpoint, { follow_mount: false });
-  
+
         if (!FS.isMountpoint(lookup.node)) {
           throw new FS.ErrnoError(28);
         }
-  
+
         // destroy the nodes for this mount, and all its child mounts
         var node = lookup.node;
         var mount = node.mounted;
         var mounts = FS.getMounts(mount);
-  
+
         Object.keys(FS.nameTable).forEach((hash) => {
           var current = FS.nameTable[hash];
-  
+
           while (current) {
             var next = current.name_next;
-  
+
             if (mounts.includes(current.mount)) {
               FS.destroyNode(current);
             }
-  
+
             current = next;
           }
         });
-  
+
         // no longer a mountpoint
         node.mounted = null;
-  
+
         // remove this mount from the child mounts
         var idx = node.mount.mounts.indexOf(mount);
         node.mount.mounts.splice(idx, 1);
@@ -29617,7 +29826,7 @@ var tempI64;
           flags: 2,
           namelen: 255,
         };
-  
+
         if (node.node_ops.statfs) {
           Object.assign(rtn, node.node_ops.statfs(node.mount.opts.root));
         }
@@ -29680,13 +29889,13 @@ var tempI64;
         var new_name = PATH.basename(new_path);
         // parents must exist
         var lookup, old_dir, new_dir;
-  
+
         // let the errors from non existent directories percolate up
         lookup = FS.lookupPath(old_path, { parent: true });
         old_dir = lookup.node;
         lookup = FS.lookupPath(new_path, { parent: true });
         new_dir = lookup.node;
-  
+
         if (!old_dir || !new_dir) throw new FS.ErrnoError(44);
         // need to be part of the same mount
         if (old_dir.mount !== new_dir.mount) {
@@ -29999,7 +30208,7 @@ var tempI64;
         }
         // we've already handled these, don't pass down to the underlying vfs
         flags &= ~(128 | 512 | 131072);
-  
+
         // register the stream with the filesystem
         var stream = FS.createStream({
           node,
@@ -30295,7 +30504,7 @@ var tempI64;
         // TODO deprecate the old functionality of a single
         // input / output callback and that utilizes FS.createDevice
         // and instead require a unique set of stream ops
-  
+
         // by default, we symlink the standard streams to the
         // default tty devices. however, if the standard streams
         // have been overwritten we create a unique device for
@@ -30315,7 +30524,7 @@ var tempI64;
         } else {
           FS.symlink('/dev/tty1', '/dev/stderr');
         }
-  
+
         // open default streams for the stdin, stdout and stderr devices
         var stdin = FS.open('/dev/stdin', 0);
         var stdout = FS.open('/dev/stdout', 1);
@@ -30323,25 +30532,25 @@ var tempI64;
       },
   staticInit() {
         FS.nameTable = new Array(4096);
-  
+
         FS.mount(MEMFS, {}, '/');
-  
+
         FS.createDefaultDirectories();
         FS.createDefaultDevices();
         FS.createSpecialDirectories();
-  
+
         FS.filesystems = {
           'MEMFS': MEMFS,
         };
       },
   init(input, output, error) {
         FS.initialized = true;
-  
+
         // Allow Module.stdin etc. to provide defaults, if none explicitly passed to us here
         input ??= Module['stdin'];
         output ??= Module['stdout'];
         error ??= Module['stderr'];
-  
+
         FS.createStandardStreams(input, output, error);
       },
   quit() {
@@ -30528,27 +30737,27 @@ var tempI64;
             var header;
             var hasByteServing = (header = xhr.getResponseHeader("Accept-Ranges")) && header === "bytes";
             var usesGzip = (header = xhr.getResponseHeader("Content-Encoding")) && header === "gzip";
-  
+
             var chunkSize = 1024*1024; // Chunk size in bytes
-  
+
             if (!hasByteServing) chunkSize = datalength;
-  
+
             // Function to get a range from the remote URL.
             var doXHR = (from, to) => {
               if (from > to) throw new Error("invalid range (" + from + ", " + to + ") or no bytes requested!");
               if (to > datalength-1) throw new Error("only " + datalength + " bytes available! programmer error!");
-  
+
               // TODO: Use mozResponseArrayBuffer, responseStream, etc. if available.
               var xhr = new XMLHttpRequest();
               xhr.open('GET', url, false);
               if (datalength !== chunkSize) xhr.setRequestHeader("Range", "bytes=" + from + "-" + to);
-  
+
               // Some hints to the browser that we want binary data.
               xhr.responseType = 'arraybuffer';
               if (xhr.overrideMimeType) {
                 xhr.overrideMimeType('text/plain; charset=x-user-defined');
               }
-  
+
               xhr.send(null);
               if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304)) throw new Error("Couldn't load " + url + ". Status: " + xhr.status);
               if (xhr.response !== undefined) {
@@ -30567,7 +30776,7 @@ var tempI64;
               if (typeof lazyArray.chunks[chunkNum] == 'undefined') throw new Error('doXHR failed!');
               return lazyArray.chunks[chunkNum];
             });
-  
+
             if (usesGzip || !datalength) {
               // if the server uses gzip or doesn't supply the length, we have to download the whole file to get the (uncompressed) length
               chunkSize = datalength = 1; // this will force getter(0)/doXHR do download the whole file
@@ -30575,7 +30784,7 @@ var tempI64;
               chunkSize = datalength;
               out("LazyFiles on gzip forces download of the whole file when length is accessed");
             }
-  
+
             this._length = datalength;
             this._chunkSize = chunkSize;
             this.lengthKnown = true;
@@ -30593,7 +30802,7 @@ var tempI64;
             return this._chunkSize;
           }
         }
-  
+
         if (typeof XMLHttpRequest != 'undefined') {
           if (!ENVIRONMENT_IS_WORKER) throw 'Cannot do synchronous binary XHRs outside webworkers in modern browsers. Use --embed-file or --preload-file in emcc';
           var lazyArray = new LazyUint8Array();
@@ -30601,7 +30810,7 @@ var tempI64;
         } else {
           var properties = { isDevice: false, url: url };
         }
-  
+
         var node = FS.createFile(parent, name, properties, canRead, canWrite);
         // This is a total hack, but I want to get this lazy file code out of the
         // core of MEMFS. If we want to keep this lazy file concept I feel it should
@@ -30663,8 +30872,8 @@ var tempI64;
         return node;
       },
   };
-  
-  
+
+
     /**
      * Given a pointer 'ptr' to a null-terminated UTF8-encoded string in the
      * emscripten HEAP, returns a copy of that string as a Javascript String object.
@@ -30762,7 +30971,7 @@ var tempI64;
   };
   function _fd_close(fd) {
   try {
-  
+
       var stream = SYSCALLS.getStreamFromFD(fd);
       FS.close(stream);
       return 0;
@@ -30789,10 +30998,10 @@ var tempI64;
       }
       return ret;
     };
-  
+
   function _fd_read(fd, iov, iovcnt, pnum) {
   try {
-  
+
       var stream = SYSCALLS.getStreamFromFD(fd);
       var num = doReadv(stream, iov, iovcnt);
       HEAPU32[((pnum)>>2)] = num;
@@ -30803,16 +31012,16 @@ var tempI64;
   }
   }
 
-  
+
   var convertI32PairToI53Checked = (lo, hi) => {
       return ((hi + 0x200000) >>> 0 < 0x400001 - !!lo) ? (lo >>> 0) + hi * 4294967296 : NaN;
     };
   function _fd_seek(fd,offset_low, offset_high,whence,newOffset) {
     var offset = convertI32PairToI53Checked(offset_low, offset_high);
-  
-    
+
+
   try {
-  
+
       if (isNaN(offset)) return 61;
       var stream = SYSCALLS.getStreamFromFD(fd);
       FS.llseek(stream, offset, whence);
@@ -30846,10 +31055,10 @@ var tempI64;
       }
       return ret;
     };
-  
+
   function _fd_write(fd, iov, iovcnt, pnum) {
   try {
-  
+
       var stream = SYSCALLS.getStreamFromFD(fd);
       var num = doWritev(stream, iov, iovcnt);
       HEAPU32[((pnum)>>2)] = num;
@@ -30864,16 +31073,16 @@ var tempI64;
       var func = Module['_' + ident]; // closure exported function
       return func;
     };
-  
+
   var writeArrayToMemory = (array, buffer) => {
       HEAP8.set(array, buffer);
     };
-  
-  
+
+
   var stringToUTF8 = (str, outPtr, maxBytesToWrite) => {
       return stringToUTF8Array(str, HEAPU8, outPtr, maxBytesToWrite);
     };
-  
+
   var stackAlloc = (sz) => __emscripten_stack_alloc(sz);
   var stringToUTF8OnStack = (str) => {
       var size = lengthBytesUTF8(str) + 1;
@@ -30881,11 +31090,11 @@ var tempI64;
       stringToUTF8(str, ret, size);
       return ret;
     };
-  
-  
-  
-  
-  
+
+
+
+
+
     /**
      * @param {string|null=} returnType
      * @param {Array=} argTypes
@@ -30908,7 +31117,7 @@ var tempI64;
           return ret;
         }
       };
-  
+
       function convertReturnValue(ret) {
         if (returnType === 'string') {
           return UTF8ToString(ret);
@@ -30916,7 +31125,7 @@ var tempI64;
         if (returnType === 'boolean') return Boolean(ret);
         return ret;
       }
-  
+
       var func = getCFunc(ident);
       var cArgs = [];
       var stack = 0;
@@ -30936,13 +31145,13 @@ var tempI64;
         if (stack !== 0) stackRestore(stack);
         return convertReturnValue(ret);
       }
-  
+
       ret = onDone(ret);
       return ret;
     };
 
-  
-  
+
+
     /**
      * @param {string=} returnType
      * @param {Array=} argTypes
